@@ -34,7 +34,6 @@ def getFolderId(folderId: str, service=Depends(driveServices.get_drive_service))
         pdf_mime = "application/pdf"
         docx_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         
-        # Build the query: folder parent AND (is PDF OR is DOCX) AND not trashed
         query = (
             f"'{folderId}' in parents and "
             f"(mimeType = '{pdf_mime}' or mimeType = '{docx_mime}') and "

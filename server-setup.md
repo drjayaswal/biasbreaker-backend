@@ -15,7 +15,7 @@ pip install -r requirements.txt
 Ensure the virtual enviroment & uvicorn are installed.
 * **Windows/macOS/Linux:** 
 ```fish
- uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 ### Step 3: Stopping the Server
 When finished, stop the server by terminating the process in your terminal or command prompt.
