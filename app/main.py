@@ -1,81 +1,206 @@
-from functools import lru_cache
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from fastapi import FastAPI, Depends
+import re
+import httpx
+import uuid
+from typing import List, Optional
+from fastapi import Form, FastAPI, UploadFile, File, HTTPException, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
-import app.services.driveServices as driveServices
-import app.services.extract as extract
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from contextlib import asynccontextmanager
+from sqlalchemy.orm.attributes import flag_modified
 
-class Settings(BaseSettings):
-    frontend_url: str
-    model_config = SettingsConfigDict(env_file=".env")
+# Internal Imports
+from app.config import settings
+from app.services.extract import extract_text
+from app.db.model import User
+from app.db.connect import init_db, get_db
+from app.services.auth import (
+    hash_password, 
+    verify_password, 
+    create_access_token, 
+    decode_token
+)
 
-@lru_cache
-def get_settings():
-    return Settings()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Starting backend: Creating database tables...")
+    init_db()
+    yield
+    print("Shutting down backend...")
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
+get_settings = settings()
+security = HTTPBearer()
 
-current_settings = get_settings() 
-
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[current_settings.frontend_url], 
+    allow_origins=[get_settings.FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return {"message": "Welcome"}
+# --- Pydantic Schemas ---
+class ConnectData(BaseModel):
+    email: str
+    password: str
 
-@app.get("/get-folder/{folderId}")
-def getFolderId(folderId: str, service=Depends(driveServices.get_drive_service)):
-    try:
-        file_types = [
-            "application/pdf",
-            "text/plain",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/msword"
-        ]
+class FolderData(BaseModel):
+    folderId: str
+    description: str
+    userId: str
+    googleToken: str
+    email: Optional[str] = None
 
-        mime_query = " or ".join([f"mimeType = '{t}'" for t in file_types])
-
-        query = f"'{folderId}' in parents and ({mime_query}) and trashed = false"
+# --- Auth Dependency ---
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Security(security), 
+    db: Session = Depends(get_db)
+):
+    token = credentials.credentials
+    payload = decode_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
     
-        results = service.files().list(
-            q=query,
-            fields="nextPageToken, files(id, name, mimeType, size)",
-            pageSize=100
-        ).execute()
-        
-        items = results.get('files', [])
+    user = db.query(User).filter(User.email == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found")
+    return user
 
-        if not items:
-            return {"message": "No files found in this folder."}
+# --- Authentication Routes ---
 
-        all_extracted_data = []
+@app.post("/connect")
+async def connect(data: ConnectData, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == data.email).first()
 
-        for file in items:
+    if user:
+        if verify_password(data.password, user.hashed_password):
+            token = create_access_token(data={"sub": user.email})
+            return {
+                "success": True, 
+                "token": token,
+                "email": user.email,
+                "id": str(user.id)
+            }
+        raise HTTPException(status_code=401, detail="Incorrect password")
+    
+    # Create new user if not exists
+    new_user = User(
+        email=data.email, 
+        hashed_password=hash_password(data.password),
+        linked_folder_ids=[],
+        processed_filenames=[]
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    token = create_access_token(data={"sub": new_user.email})
+    return {
+        "success": True,
+        "token": token,
+        "email": new_user.email,
+        "id": str(new_user.id)
+    }
+
+@app.get("/auth/me")
+async def get_me(current_user: User = Depends(get_current_user)):
+    return {"email": current_user.email, "id": str(current_user.id), "authenticated": True}
+
+# --- Core Logic Routes ---
+
+@app.post("/get-folder")
+async def get_folder(
+    request_data: FolderData, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    results = []
+    filenames_to_save = []
+
+    async with httpx.AsyncClient() as client:
+        # 1. Fetch files from Google Drive folder
+        drive_url = f"https://www.googleapis.com/drive/v3/files?q='{request_data.folderId}'+in+parents+and+trashed=false"
+        drive_resp = await client.get(
+            drive_url, 
+            headers={"Authorization": f"Bearer {request_data.googleToken}"}
+        )
+        files = drive_resp.json().get("files", [])
+
+        for drive_file in files:
+            file_id = drive_file["id"]
+            filename = drive_file["name"]
+            mime_type = drive_file.get("mimeType", "text/plain")
+            
+            # 2. Download content from Drive
+            download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+            file_content_resp = await client.get(
+                download_url, 
+                headers={"Authorization": f"Bearer {request_data.googleToken}"}
+            )
+            
+            if file_content_resp.status_code == 200:
+                # 3. Process and analyze
+                raw_text = extract_text(file_content_resp.content, mime_type)
+                words = re.findall(r'\b\w+\b', raw_text.lower())
+
+                ml_resp = await client.post(
+                    f"{get_settings.ML_SERVER_URL}/analyze", 
+                    json={
+                        "filename": filename, 
+                        "words": words, 
+                        "description": request_data.description
+                    },
+                    timeout=60.0
+                )
+                results.append({"filename": filename, "ml_analysis": ml_resp.json()})
+                filenames_to_save.append(filename)
+
+    # Update User History
+    current_user.processed_filenames = (list(current_user.processed_filenames or []) + filenames_to_save)[-100:]
+    flag_modified(current_user, "processed_filenames")
+    db.commit()
+    
+    return results
+
+@app.post("/upload")
+async def upload_files(
+    files: List[UploadFile] = File(...), 
+    description: str = Form(""),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    results = []
+    filenames_to_save = []
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for file in files:
+            content = await file.read()
+            raw_text = extract_text(content, file.content_type)
+            words = re.findall(r'\b\w+\b', raw_text.lower())
+
             try:
-                
-                file_content_bytes = service.files().get_media(fileId=file["id"]).execute()
-
-                word_array = extract.text(file_content_bytes, file["mimeType"])
-                
-                all_extracted_data.append({
-                    "fileName": file['name'],
-                    "content": word_array
-                })
-
-                print(f"Processed: ({file['id']})")
-
+                ml_resp = await client.post(
+                    f"{get_settings.ML_SERVER_URL}/analyze", 
+                    json={
+                        "filename": file.filename, 
+                        "words": words, 
+                        "description": description
+                    },
+                    timeout=60.0
+                )
+                ml_data = ml_resp.json()
             except Exception as e:
-                print(f"Failed to process {file['name']}: {e}")
-                continue
+                ml_data = {"error": "ML Analysis failed", "details": str(e)}
 
-        print(all_extracted_data)
-        return {"status": "success", "data": all_extracted_data}
+            results.append({"filename": file.filename, "ml_analysis": ml_data})
+            filenames_to_save.append(file.filename)
 
-    except Exception as e:
-        return {"error": str(e)}
+    # Track only filenames in DB (PostgreSQL Array)
+    current_user.processed_filenames = (list(current_user.processed_filenames or []) + filenames_to_save)[-100:]
+    flag_modified(current_user, "processed_filenames")
+    db.commit()
+    
+    return results
