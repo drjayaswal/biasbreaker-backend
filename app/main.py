@@ -69,8 +69,35 @@ async def get_current_user(
         raise HTTPException(status_code=404, detail="User account not found")
     return user
 
-# --- Authentication Routes ---
+# --- Helper Logic: Persistence ---
+def save_to_history(db: Session, user: User, new_results: List[dict]):
+    """
+    Standardized function to save results from any source into the User history.
+    """
+    if not new_results:
+        return
+    
+    # Get current history (JSON list)
+    current_history = list(user.analysis_history or [])
+    
+    # Combine lists (New results at the top)
+    updated_history = (new_results + current_history)[:100]
+    
+    # Update the model
+    user.analysis_history = updated_history
+    
+    # Update legacy list for backward compatibility
+    new_filenames = [r["filename"] for r in new_results]
+    user.processed_filenames = (list(user.processed_filenames or []) + new_filenames)[-100:]
+    
+    # Tell SQLAlchemy the JSON column has changed
+    flag_modified(user, "analysis_history")
+    flag_modified(user, "processed_filenames")
+    
+    db.commit()
+    db.refresh(user)
 
+# --- Authentication Routes ---
 @app.post("/connect")
 async def connect(data: ConnectData, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email).first()
@@ -109,98 +136,96 @@ async def connect(data: ConnectData, db: Session = Depends(get_db)):
 async def get_me(current_user: User = Depends(get_current_user)):
     return {"email": current_user.email, "id": str(current_user.id), "authenticated": True}
 
+
+
 # --- Core Logic Routes ---
+
+@app.get("/history")
+async def get_history(current_user: User = Depends(get_current_user)):
+    """
+    Returns the persistent analysis history for the logged-in user.
+    """
+    return current_user.analysis_history or []
 
 @app.post("/get-folder")
 async def get_folder(
     request_data: FolderData, 
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db), 
     current_user: User = Depends(get_current_user)
 ):
     results = []
-    filenames_to_save = []
-
-    async with httpx.AsyncClient() as client:
-        # 1. Fetch files from Google Drive folder
+    # Set a high timeout (60s) for Drive downloads and ML processing
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # 1. Fetch files list from Google Drive
         drive_url = f"https://www.googleapis.com/drive/v3/files?q='{request_data.folderId}'+in+parents+and+trashed=false"
         drive_resp = await client.get(
             drive_url, 
             headers={"Authorization": f"Bearer {request_data.googleToken}"}
         )
+        
+        if drive_resp.status_code != 200:
+            raise HTTPException(status_code=drive_resp.status_code, detail="Failed to fetch Drive folder")
+            
         files = drive_resp.json().get("files", [])
 
-        for drive_file in files:
-            file_id = drive_file["id"]
-            filename = drive_file["name"]
-            mime_type = drive_file.get("mimeType", "text/plain")
-            
-            # 2. Download content from Drive
-            download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-            file_content_resp = await client.get(
+        for f in files:
+            # 2. Download file content
+            download_url = f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media"
+            file_content = await client.get(
                 download_url, 
                 headers={"Authorization": f"Bearer {request_data.googleToken}"}
             )
             
-            if file_content_resp.status_code == 200:
-                # 3. Process and analyze
-                raw_text = extract_text(file_content_resp.content, mime_type)
+            if file_content.status_code == 200:
+                # 3. Extract text and clean
+                raw_text = extract_text(file_content.content, f.get("mimeType", "text/plain"))
                 words = re.findall(r'\b\w+\b', raw_text.lower())
-
+                
+                # 4. Forward to ML Analysis Server
                 ml_resp = await client.post(
                     f"{get_settings.ML_SERVER_URL}/analyze", 
                     json={
-                        "filename": filename, 
+                        "filename": f["name"], 
                         "words": words, 
                         "description": request_data.description
-                    },
-                    timeout=60.0
+                    }
                 )
-                results.append({"filename": filename, "ml_analysis": ml_resp.json()})
-                filenames_to_save.append(filename)
+                
+                if ml_resp.status_code == 200:
+                    results.append({"filename": f["name"], "ml_analysis": ml_resp.json()})
 
-    # Update User History
-    current_user.processed_filenames = (list(current_user.processed_filenames or []) + filenames_to_save)[-100:]
-    flag_modified(current_user, "processed_filenames")
-    db.commit()
-    
+    # Save everything found in this interaction to permanent DB
+    save_to_history(db, current_user, results)
     return results
 
 @app.post("/upload")
 async def upload_files(
     files: List[UploadFile] = File(...), 
-    description: str = Form(""),
-    current_user: User = Depends(get_current_user),
+    description: str = Form(""), 
+    current_user: User = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
     results = []
-    filenames_to_save = []
-
     async with httpx.AsyncClient(timeout=60.0) as client:
         for file in files:
             content = await file.read()
+            # 1. Extract text
             raw_text = extract_text(content, file.content_type)
             words = re.findall(r'\b\w+\b', raw_text.lower())
+            
+            # 2. Forward to ML Analysis Server
+            ml_resp = await client.post(
+                f"{get_settings.ML_SERVER_URL}/analyze", 
+                json={
+                    "filename": file.filename, 
+                    "words": words, 
+                    "description": description
+                }
+            )
+            
+            if ml_resp.status_code == 200:
+                results.append({"filename": file.filename, "ml_analysis": ml_resp.json()})
 
-            try:
-                ml_resp = await client.post(
-                    f"{get_settings.ML_SERVER_URL}/analyze", 
-                    json={
-                        "filename": file.filename, 
-                        "words": words, 
-                        "description": description
-                    },
-                    timeout=60.0
-                )
-                ml_data = ml_resp.json()
-            except Exception as e:
-                ml_data = {"error": "ML Analysis failed", "details": str(e)}
-
-            results.append({"filename": file.filename, "ml_analysis": ml_data})
-            filenames_to_save.append(file.filename)
-
-    # Track only filenames in DB (PostgreSQL Array)
-    current_user.processed_filenames = (list(current_user.processed_filenames or []) + filenames_to_save)[-100:]
-    flag_modified(current_user, "processed_filenames")
-    db.commit()
-    
+    # Save these uploads to permanent DB
+    save_to_history(db, current_user, results)
     return results
