@@ -1,5 +1,4 @@
 import io
-import re
 from PyPDF2 import PdfReader
 from docx import Document
 

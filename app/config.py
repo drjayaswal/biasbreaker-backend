@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     ML_SERVER_URL: str
     SECRET_KEY: str
     ALGORITHM: str
+    AWS_ACCESS_KEY: str
+    AWS_SECRET_ACCESS_KEY: str
+    AWS_REGION: str
+    AWS_BUCKET_NAME: str
+    DELETE_S3_AFTER_PROCESSING: bool = True
 
     model_config = SettingsConfigDict(env_file=".env")
 

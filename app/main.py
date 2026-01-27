@@ -1,19 +1,30 @@
-import re
+import uuid
+import logging
 import httpx
-from typing import List, Optional
-from fastapi import Form, FastAPI, UploadFile, File, HTTPException, Depends, Security
+
+from typing import List
+from pydantic import BaseModel
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from fastapi import BackgroundTasks, UploadFile, File, Form, Depends, HTTPException
+from fastapi import Form, FastAPI, UploadFile, File, HTTPException, Depends, Security
+
 from sqlalchemy.orm import Session
-from contextlib import asynccontextmanager
 from sqlalchemy.orm.attributes import flag_modified
 
+from contextlib import asynccontextmanager
+
 # Internal Imports
+from app.db.models import User
 from app.config import settings
-from app.services.extract import extract_text
-from app.db.model import User
+from app.db.models import ResumeAnalysis
+from app.db.schemas import FolderData
 from app.db.connect import init_db, get_db
+from app.services.process import ml_analysis_s3,ml_analysis_drive
+from app.services.awsClient import s3_client
+from app.db.cruds import create_initial_record
+from app.services.awsClient import upload_to_s3
 from app.services.auth import (
     hash_password, 
     verify_password, 
@@ -31,6 +42,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 get_settings = settings()
 security = HTTPBearer()
+logger = logging.getLogger(__name__)
+
 
 # CORS Configuration
 app.add_middleware(
@@ -46,12 +59,12 @@ class ConnectData(BaseModel):
     email: str
     password: str
 
-class FolderData(BaseModel):
-    folderId: str
-    description: str
-    userId: str
-    googleToken: str
-    email: Optional[str] = None
+# class FolderData(BaseModel):
+#     folderId: str
+#     description: str
+#     userId: str
+#     googleToken: str
+#     email: Optional[str] = None
 
 # --- Auth Dependency ---
 async def get_current_user(
@@ -137,120 +150,101 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 
 
-# --- Core Logic Routes ---
-@app.get("/history")
-async def get_history(current_user: User = Depends(get_current_user)):
-    """
-    Returns the persistent analysis history for the logged-in user.
-    """
-    return current_user.analysis_history or []
 
-@app.post("/get-folder")
-async def get_folder(
-    request_data: FolderData, 
-    db: Session = Depends(get_db), 
-    current_user: User = Depends(get_current_user)
-):
-    results = []
-    # Set a high timeout (60s) for Drive downloads and ML processing
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # 1. Fetch files list from Google Drive
-        drive_url = f"https://www.googleapis.com/drive/v3/files?q='{request_data.folderId}'+in+parents+and+trashed=false"
-        drive_resp = await client.get(
-            drive_url, 
-            headers={"Authorization": f"Bearer {request_data.googleToken}"}
-        )
-        
-        if drive_resp.status_code != 200:
-            raise HTTPException(status_code=drive_resp.status_code, detail="Failed to fetch Drive folder")
-            
-        files = drive_resp.json().get("files", [])
-
-        for f in files:
-            # 2. Download file content
-            download_url = f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media"
-            file_content = await client.get(
-                download_url, 
-                headers={"Authorization": f"Bearer {request_data.googleToken}"}
-            )
-            
-            if file_content.status_code == 200:
-                # 3. Extract text and clean
-                raw_text = extract_text(file_content.content, f.get("mimeType", "text/plain"))
-                words = re.findall(r'\b\w+\b', raw_text.lower())
-                
-                # 4. Forward to ML Analysis Server
-                ml_resp = await client.post(
-                    f"{get_settings.ML_SERVER_URL}/analyze", 
-                    json={
-                        "filename": f["name"], 
-                        "words": words, 
-                        "description": request_data.description
-                    }
-                )
-                
-                if ml_resp.status_code == 200:
-                    results.append({"filename": f["name"], "ml_analysis": ml_resp.json()})
-
-    # Save everything found in this interaction to permanent DB
-    save_to_history(db, current_user, results)
-    return results
-
-@app.post("/get-description")
-async def get_description(file: UploadFile = File(...)):
-
-    content = await file.read()
-
-    text = extract_text(content, file.content_type)
-    
-    return {"description": text}
 
 @app.delete("/reset-history")
 async def reset_history(
     db: Session = Depends(get_db), 
     current_user: User = Depends(get_current_user)
 ):
-    try:
-        current_user.analysis_history = []
-        current_user.processed_filenames = []
-        
-        flag_modified(current_user, "analysis_history")
-        flag_modified(current_user, "processed_filenames")
-        
-        db.commit()
-        return {"status": "success", "message": "Analysis history has been reset"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to reset history: {str(e)}")
+    analyses = db.query(ResumeAnalysis).filter(ResumeAnalysis.user_id == current_user.id).all()
+    
+    for item in analyses:
+        try:
+            s3_client.delete_object(Bucket=get_settings.AWS_BUCKET_NAME, Key=item.s3_key)
+        except:
+            pass
+        db.delete(item)
+    
+    db.commit()
+    return {"status": "success"}
 
-@app.post("/upload")
-async def upload_files(
-    files: List[UploadFile] = File(...), 
-    description: str = Form(""), 
+@app.get("/history")
+async def get_history(
     current_user: User = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
-    results = []
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        for file in files:
-            content = await file.read()
-            # 1. Extract text
-            raw_text = extract_text(content, file.content_type)
-            words = re.findall(r'\b\w+\b', raw_text.lower())
-            
-            # 2. Forward to ML Analysis Server
-            ml_resp = await client.post(
-                f"{get_settings.ML_SERVER_URL}/analyze", 
-                json={
-                    "filename": file.filename, 
-                    "words": words, 
-                    "description": description
-                }
-            )
-            
-            if ml_resp.status_code == 200:
-                results.append({"filename": file.filename, "ml_analysis": ml_resp.json()})
+    return db.query(ResumeAnalysis)\
+             .filter(ResumeAnalysis.user_id == current_user.id)\
+             .order_by(ResumeAnalysis.created_at.desc())\
+             .all()
 
-    # Save these uploads to permanent DB
-    save_to_history(db, current_user, results)
-    return results
+@app.post("/get-folder")
+async def get_folder(
+    request_data: FolderData, 
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user)
+):
+    async with httpx.AsyncClient() as client:
+        drive_url = (
+            f"https://www.googleapis.com/drive/v3/files?"
+            f"q='{request_data.folderId}'+in+parents+and+trashed=false"
+            f"&fields=files(id, name, mimeType)"
+        )
+        headers = {"Authorization": f"Bearer {request_data.googleToken}"}
+        response = await client.get(drive_url, headers=headers)
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Drive access failed")
+            
+        files = response.json().get("files", [])
+        # Only process actual files, not folders
+        file_list = [f for f in files if f['mimeType'] != 'application/vnd.google-apps.folder']
+
+    if not file_list:
+        return {"message": "No files found."}
+
+    # Pass everything to the background worker
+    background_tasks.add_task(
+        ml_analysis_drive,
+        str(current_user.id),
+        file_list,
+        request_data.googleToken,
+        request_data.description
+    )
+
+    return {"message": f"Queued {len(file_list)} files for background processing.","files":file_list}
+
+@app.post("/upload")
+async def upload_files(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    description: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    for file in files:
+        file_id = uuid.uuid4()
+        s3_url, s3_key = await upload_to_s3(file, file.filename)
+        
+        # Create DB entry
+        create_initial_record(db, current_user.id, file.filename, s3_key, file_id)
+        
+        # Trigger ML Task
+        background_tasks.add_task(ml_analysis_s3, str(file_id), s3_url, file.filename, description)
+    
+    return {"message": "Processing started"}
+
+
+    async with httpx.AsyncClient() as client:
+        # Fetch files from Google
+        drive_url = f"https://www.googleapis.com/drive/v3/files?q='{request_data.folderId}'+in+parents+and+trashed=false"
+        headers = {"Authorization": f"Bearer {request_data.googleToken}"}
+        resp = await client.get(drive_url, headers=headers)
+        
+        files = [f for f in resp.json().get("files", []) if f['mimeType'] != 'application/vnd.google-apps.folder']
+
+    # Trigger ML Task for the whole list
+    background_tasks.add_task(ml_analysis_drive, current_user.id, files, request_data.googleToken, request_data.description)
+    
+    return {"message": f"Processing {len(files)} files from Drive"}
